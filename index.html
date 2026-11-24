@@ -2177,7 +2177,7 @@ html[data-theme=dark] .filters{background:var(--surface-1)}
         $('adminCatalog').innerHTML = `
           <div class="row between" style="flex-wrap:wrap;margin-bottom:10px">
             <div><h3 style="margin:0">📦 Product Catalog (${db.products.length})</h3><div class="muted tiny">Items you add here appear instantly for buyers.</div></div>
-            <button id="adminAddProdBtn">＋ Add New Item</button>
+            <div class="row" style="gap:8px;flex-wrap:wrap"><button class="secondary" id="adminExportBtn">⬇ Export products.json</button><button id="adminAddProdBtn">＋ Add New Item</button></div>
           </div>
           <div style="overflow-x:auto"><table class="table"><thead><tr><th>Item</th><th>Shop</th><th>Price</th><th>Stock</th><th>Actions</th></tr></thead><tbody>
           ${db.products.map((p) => `<tr>
@@ -2187,6 +2187,7 @@ html[data-theme=dark] .filters{background:var(--surface-1)}
           </tr>`).join('') || '<tr><td colspan="5" class="muted">No items yet.</td></tr>'}
           </tbody></table></div>`;
         $('adminAddProdBtn').onclick = () => openAdminProductModal();
+        $('adminExportBtn').onclick = exportCatalog;
         Motion.animateCounters('#page-admin');
       }
 
@@ -2689,6 +2690,76 @@ html[data-theme=dark] .filters{background:var(--surface-1)}
         saveDB();
         renderBadges();
       };
+      // ===== Step 2: shared catalog (products.json) =====
+      const crcTable = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+      const crc32 = (u8) => { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = crcTable[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+
+      // Minimal ZIP writer (store method, no compression) so no library is needed
+      function makeZip(files) {
+        const enc = new TextEncoder(), parts = [], central = [];
+        let offset = 0;
+        for (const f of files) {
+          const nameB = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+          const lh = new DataView(new ArrayBuffer(30));
+          lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
+          lh.setUint16(12, 0x21, true); lh.setUint32(14, crc, true); lh.setUint32(18, size, true);
+          lh.setUint32(22, size, true); lh.setUint16(26, nameB.length, true);
+          parts.push(new Uint8Array(lh.buffer), nameB, f.data);
+          const ch = new DataView(new ArrayBuffer(46));
+          ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true);
+          ch.setUint16(14, 0x21, true); ch.setUint32(16, crc, true); ch.setUint32(20, size, true);
+          ch.setUint32(24, size, true); ch.setUint16(28, nameB.length, true); ch.setUint32(42, offset, true);
+          central.push(new Uint8Array(ch.buffer), nameB);
+          offset += 30 + nameB.length + size;
+        }
+        const cdSize = central.reduce((a, b) => a + b.length, 0);
+        const end = new DataView(new ArrayBuffer(22));
+        end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+        end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+        return new Blob([...parts, ...central, new Uint8Array(end.buffer)], { type: 'application/zip' });
+      }
+
+      function exportCatalog() {
+        const files = [];
+        const products = db.products.map((p) => {
+          const q = { ...p };
+          if (typeof q.image === 'string' && q.image.startsWith('data:')) {
+            const slug = String(p.name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'item';
+            const path = `images/products/${p.id}-${slug}.jpg`;
+            const bin = atob(q.image.split(',')[1] || '');
+            files.push({ name: path, data: Uint8Array.from(bin, (c) => c.charCodeAt(0)) });
+            q.image = path;
+          }
+          return q;
+        });
+        const version = Date.now();
+        const catalog = { version, updated: new Date().toISOString(), shops: db.shops, coupons: db.coupons, products };
+        files.unshift({ name: 'products.json', data: new TextEncoder().encode(JSON.stringify(catalog, null, 2)) });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(makeZip(files));
+        a.download = 'smartbuy-catalog.zip';
+        a.click();
+        db.catalogVersion = version; saveDB();
+        toast(`Exported products.json + ${files.length - 1} photo(s). Unzip and upload to GitHub.`);
+      }
+
+      // On every page load: use products.json as the catalog when it has a newer version
+      async function loadCatalog() {
+        try {
+          const r = await fetch('products.json?_=' + Date.now(), { cache: 'no-store' });
+          if (!r.ok) return;
+          const cat = await r.json();
+          if (!cat || !Array.isArray(cat.products) || !cat.products.length) return;
+          if (db.catalogVersion === cat.version) return;
+          db.products = cat.products;
+          if (Array.isArray(cat.shops) && cat.shops.length) db.shops = cat.shops;
+          if (Array.isArray(cat.coupons)) db.coupons = cat.coupons;
+          db.catalogVersion = cat.version;
+          saveDB(); renderActivePage();
+        } catch {}
+      }
+      loadCatalog();
+
       $('modalCloseBtn').onclick = closeModal;
       $('modalBack').addEventListener('click', (e) => {
         if (e.target === $('modalBack')) closeModal();
